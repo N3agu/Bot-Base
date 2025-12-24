@@ -40,7 +40,16 @@ def replace_placeholders(obj, member):
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
+        self.tree.on_error = self.on_tree_error
         await self.tree.sync()
+
+    async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+        else:
+            logging.error(f"Interaction error: {error}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("An internal error occurred.", ephemeral=True)
 
 bot = MyBot(command_prefix='!', intents=intents)
 
@@ -100,6 +109,7 @@ async def on_member_join(member):
 
 @bot.tree.command(name="embed", description="Parse JSON and post message with embeds")
 @app_commands.describe(embed_json="Raw JSON string for the message payload")
+@app_commands.checks.has_permissions(administrator=True)
 async def embed_command(interaction: discord.Interaction, embed_json: str):
     try:
         data = json.loads(embed_json)
@@ -115,7 +125,6 @@ async def embed_command(interaction: discord.Interaction, embed_json: str):
             return
 
         await interaction.response.send_message("Embed posted successfully.", ephemeral=True)
-        
         await interaction.channel.send(content=content, embeds=embeds[:10])
         
     except json.JSONDecodeError:
@@ -130,6 +139,7 @@ async def embed_command(interaction: discord.Interaction, embed_json: str):
     embed_json="Raw JSON for the welcome message",
     role="Optional role to give to new members"
 )
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_command(interaction: discord.Interaction, channel: discord.TextChannel, embed_json: str, role: discord.Role = None):
     try:
         data = json.loads(embed_json)
