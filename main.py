@@ -85,6 +85,34 @@ def get_owner_id(channel):
             return None
     return None
 
+def calculate_invites(guild, inviter_id, invites_data):
+    """Helper to calculate stats for a specific inviter."""
+    guild_id = str(guild.id)
+    if guild_id not in invites_data:
+        return 0, 0, 0
+        
+    real_count = 0
+    fake_count = 0
+    left_count = 0
+    
+    inviter_records = [
+        (uid, data) for uid, data in invites_data[guild_id].items()
+        if data.get('inviter_id') == inviter_id
+    ]
+    
+    for uid_str, data in inviter_records:
+        if data.get('is_fake'):
+            fake_count += 1
+            continue
+            
+        mem = guild.get_member(int(uid_str))
+        if mem:
+            real_count += 1
+        else:
+            left_count += 1
+            
+    return real_count, fake_count, left_count
+
 class TicketClosedView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -338,25 +366,7 @@ async def on_member_join(member):
                 }
                 save_json(INVITES_FILE, invites_data)
                 
-                inviter_records = [
-                    (uid, data) for uid, data in invites_data[guild_id].items()
-                    if data.get('inviter_id') == inviter.id
-                ]
-                
-                real_count = 0
-                fake_count = 0
-                left_count = 0
-                
-                for uid_str, data in inviter_records:
-                    if data.get('is_fake'):
-                        fake_count += 1
-                        continue
-                        
-                    mem = member.guild.get_member(int(uid_str))
-                    if mem:
-                        real_count += 1
-                    else:
-                        left_count += 1
+                real, fake, left = calculate_invites(member.guild, inviter.id, invites_data)
 
                 channel = member.guild.get_channel(track_channel_id)
                 if channel:
@@ -365,9 +375,9 @@ async def on_member_join(member):
                         "description": f"Invited by {inviter.mention}",
                         "thumbnail": {"url": member.avatar.url if member.avatar else member.default_avatar.url},
                         "fields": [
-                            {"name": "Real", "value": str(real_count), "inline": True},
-                            {"name": "Fake", "value": str(fake_count), "inline": True},
-                            {"name": "Left", "value": str(left_count), "inline": True}
+                            {"name": "Real", "value": str(real), "inline": True},
+                            {"name": "Fake", "value": str(fake), "inline": True},
+                            {"name": "Left", "value": str(left), "inline": True}
                         ],
                         "footer": {"text": f"Account Created: {member.created_at.strftime('%Y-%m-%d %H:%M:%S')}"}
                     }
@@ -378,6 +388,42 @@ async def on_member_join(member):
             logging.error("Permission denied for invite tracking.")
         except Exception as e:
             logging.error(f"Invite tracking error: {e}")
+
+@bot.event
+async def on_member_remove(member):
+    """Handle Member Leave: Update stats and post to log channel."""
+    config = load_json(CONFIG_FILE)
+    invites_data = load_json(INVITES_FILE)
+    guild_id = str(member.guild.id)
+    
+    track_channel_id = config.get(guild_id, {}).get('invite_log_channel')
+    
+    if track_channel_id and guild_id in invites_data:
+        member_id = str(member.id)
+        if member_id in invites_data[guild_id]:
+            record = invites_data[guild_id][member_id]
+            inviter_id = record.get('inviter_id')
+            
+            if inviter_id:
+                real, fake, left = calculate_invites(member.guild, inviter_id, invites_data)
+                
+                inviter = member.guild.get_member(inviter_id)
+                inviter_mention = inviter.mention if inviter else "Unknown User"
+
+                channel = member.guild.get_channel(track_channel_id)
+                if channel:
+                    embed_data = {
+                        "title": f"{member.name} Left",
+                        "description": f"Was invited by {inviter_mention}",
+                        "thumbnail": {"url": member.avatar.url if member.avatar else member.default_avatar.url},
+                        "fields": [
+                            {"name": "Real", "value": str(real), "inline": True},
+                            {"name": "Fake", "value": str(fake), "inline": True},
+                            {"name": "Left", "value": str(left), "inline": True}
+                        ]
+                    }
+                    embed_data = apply_theme(embed_data, guild_id)
+                    await channel.send(embed=discord.Embed.from_dict(embed_data))
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -787,34 +833,15 @@ async def invites_command(interaction: discord.Interaction, user: discord.Member
     invites_data = load_json(INVITES_FILE)
     guild_id = str(interaction.guild_id)
     
-    real_count = 0
-    fake_count = 0
-    left_count = 0
-    
-    if guild_id in invites_data:
-        inviter_records = [
-            (uid, data) for uid, data in invites_data[guild_id].items()
-            if data.get('inviter_id') == user.id
-        ]
-        
-        for uid_str, data in inviter_records:
-            if data.get('is_fake'):
-                fake_count += 1
-                continue
-                
-            mem = interaction.guild.get_member(int(uid_str))
-            if mem:
-                real_count += 1
-            else:
-                left_count += 1
+    real, fake, left = calculate_invites(interaction.guild, user.id, invites_data)
 
     embed_data = {
         "title": f"{user.name}'s Invites",
         "thumbnail": {"url": user.avatar.url if user.avatar else user.default_avatar.url},
         "fields": [
-            {"name": "Real", "value": str(real_count), "inline": True},
-            {"name": "Fake", "value": str(fake_count), "inline": True},
-            {"name": "Left", "value": str(left_count), "inline": True}
+            {"name": "Real", "value": str(real), "inline": True},
+            {"name": "Fake", "value": str(fake), "inline": True},
+            {"name": "Left", "value": str(left), "inline": True}
         ],
         "footer": {"text": f"Account Created: {user.created_at.strftime('%Y-%m-%d %H:%M:%S')}"}
     }
