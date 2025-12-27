@@ -4,6 +4,7 @@ import json
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord import ui
 from dotenv import load_dotenv
 
 logging.basicConfig(
@@ -59,9 +60,153 @@ def apply_theme(data, guild_id):
         
     return data
 
+def is_staff(interaction: discord.Interaction):
+    """Checks if the user is Admin or has a Ticket Staff role."""
+    if interaction.user.guild_permissions.administrator:
+        return True
+    
+    config = load_config()
+    guild_id = str(interaction.guild_id)
+    if guild_id in config and 'ticket_staff' in config[guild_id]:
+        staff_roles = config[guild_id]['ticket_staff']
+        user_role_ids = [r.id for r in interaction.user.roles]
+
+        if any(sid in user_role_ids for sid in staff_roles):
+            return True
+            
+    return False
+
+def get_owner_id(channel):
+    """Extracts owner ID from channel topic."""
+    if channel.topic and channel.topic.startswith("Ticket Owner:"):
+        try:
+            return int(channel.topic.split(":")[1].strip())
+        except:
+            return None
+    return None
+
+class TicketClosedView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="Reopen", style=discord.ButtonStyle.green, custom_id="ticket_reopen", emoji="🔓")
+    async def reopen(self, interaction: discord.Interaction, button: ui.Button):
+        owner_id = get_owner_id(interaction.channel)
+        is_owner = owner_id == interaction.user.id
+        is_authorized = is_staff(interaction)
+
+        if not (is_authorized or is_owner):
+            await interaction.response.send_message("You do not have permission to reopen this ticket.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        if owner_id:
+            member = interaction.guild.get_member(owner_id)
+            if member:
+                await interaction.channel.set_permissions(member, send_messages=True, read_messages=True)
+
+        await interaction.channel.send("Ticket reopened.", view=TicketControlsView())
+        
+        try:
+            await interaction.message.delete()
+        except:
+            pass
+
+    @ui.button(label="Delete", style=discord.ButtonStyle.red, custom_id="ticket_delete", emoji="⛔")
+    async def delete(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_staff(interaction):
+            await interaction.response.send_message("Only Ticket Staff can delete tickets.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("Deleting ticket in 3 seconds...", ephemeral=True)
+        await interaction.channel.delete()
+
+class TicketControlsView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="Close", style=discord.ButtonStyle.red, custom_id="ticket_close", emoji="🔒")
+    async def close(self, interaction: discord.Interaction, button: ui.Button):
+        owner_id = get_owner_id(interaction.channel)
+        is_owner = owner_id == interaction.user.id
+        is_authorized = is_staff(interaction)
+
+        if not (is_authorized or is_owner):
+            await interaction.response.send_message("You do not have permission to close this ticket.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        if owner_id:
+            member = interaction.guild.get_member(owner_id)
+            if member:
+                await interaction.channel.set_permissions(member, send_messages=False, read_messages=True)
+
+        await interaction.channel.send("Ticket Closed. Choose an action:", view=TicketClosedView())
+
+class TicketView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="Open Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket", emoji="📩")
+    async def create_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        config = load_config()
+        message_id = str(interaction.message.id)
+        guild_id = str(interaction.guild_id)
+        
+        tickets_config = config.get('tickets', {})
+        category_id = tickets_config.get(message_id)
+        
+        if not category_id:
+            await interaction.followup.send("Error: Ticket configuration not found for this panel.", ephemeral=True)
+            return
+
+        category = interaction.guild.get_channel(category_id)
+        if not category:
+            await interaction.followup.send("Error: Ticket category no longer exists.", ephemeral=True)
+            return
+
+        overrides = {
+            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+
+        if guild_id in config and 'ticket_staff' in config[guild_id]:
+            for role_id in config[guild_id]['ticket_staff']:
+                role = interaction.guild.get_role(role_id)
+                if role:
+                    overrides[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        try:
+            channel_name = f"ticket-{interaction.user.name}"
+            ticket_channel = await interaction.guild.create_text_channel(
+                name=channel_name, 
+                category=category, 
+                overwrites=overrides,
+                topic=f"Ticket Owner: {interaction.user.id}"
+            )
+            
+            await interaction.followup.send(f"Ticket created: {ticket_channel.mention}", ephemeral=True)
+            
+            await ticket_channel.send(
+                f"{interaction.user.mention} Welcome to your ticket! Staff will answer as soon as possible.",
+                view=TicketControlsView()
+            )
+            
+        except Exception as e:
+            logging.error(f"Ticket creation error: {e}")
+            await interaction.followup.send("Failed to create ticket channel. Check bot permissions.", ephemeral=True)
+
 class MyBot(commands.Bot):
     async def setup_hook(self):
         self.tree.on_error = self.on_tree_error
+        self.add_view(TicketView())
+        self.add_view(TicketControlsView())
+        self.add_view(TicketClosedView())
         await self.tree.sync()
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -159,6 +304,9 @@ async def theme_command(interaction: discord.Interaction, primary: str, secondar
         if guild_id not in config:
             config[guild_id] = {}
         
+        if 'theme' not in config[guild_id]:
+             config[guild_id]['theme'] = {}
+
         config[guild_id]['theme'] = {'primary': p_int, 'secondary': s_int}
         save_config(config)
         
@@ -328,6 +476,88 @@ async def status_command(interaction: discord.Interaction, activity: app_command
     except Exception as e:
         logging.error(f"Status update error: {e}")
         await interaction.response.send_message("Failed to update status.", ephemeral=True)
+
+@bot.tree.command(name="ticketpanel", description="Create a ticket panel in a specific channel")
+@app_commands.describe(channel="Channel to post the panel", category_id="ID of the category for new tickets", embed_json="JSON for the panel embed")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketpanel_command(interaction: discord.Interaction, channel: discord.TextChannel, category_id: str, embed_json: str):
+    try:
+        try:
+            cat_id_int = int(category_id)
+            category = interaction.guild.get_channel(cat_id_int)
+            if not category or not isinstance(category, discord.CategoryChannel):
+                 await interaction.response.send_message("Invalid Category ID provided.", ephemeral=True)
+                 return
+        except ValueError:
+            await interaction.response.send_message("Category ID must be a number.", ephemeral=True)
+            return
+
+        data = json.loads(embed_json)
+        data = apply_theme(data, str(interaction.guild_id))
+        
+        embeds = []
+        if 'embeds' in data:
+            embeds = [discord.Embed.from_dict(e) for e in data['embeds']]
+        elif any(k in data for k in ('title', 'description', 'fields', 'color')):
+            embeds = [discord.Embed.from_dict(data)]
+            
+        content = data.get('content')
+
+        if not content and not embeds:
+            await interaction.response.send_message("JSON must contain 'content' or 'embeds'.", ephemeral=True)
+            return
+
+        message = await channel.send(content=content, embeds=embeds[:10], view=TicketView())
+        
+        config = load_config()
+        if 'tickets' not in config:
+            config['tickets'] = {}
+        
+        config['tickets'][str(message.id)] = cat_id_int
+        save_config(config)
+
+        await interaction.response.send_message(f"Ticket panel created in {channel.mention}", ephemeral=True)
+
+    except json.JSONDecodeError:
+        await interaction.response.send_message("Error: Invalid JSON format.", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Ticket panel error: {e}")
+        await interaction.response.send_message(f"Error creating panel: {e}", ephemeral=True)
+
+@bot.tree.command(name="ticketstaff", description="Add or remove roles that can manage tickets")
+@app_commands.describe(action="Add or Remove a role", role="The role to configure")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Add", value="add"),
+    app_commands.Choice(name="Remove", value="remove")
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketstaff_command(interaction: discord.Interaction, action: app_commands.Choice[str], role: discord.Role):
+    config = load_config()
+    guild_id = str(interaction.guild_id)
+    
+    if guild_id not in config:
+        config[guild_id] = {}
+        
+    if 'ticket_staff' not in config[guild_id]:
+        config[guild_id]['ticket_staff'] = []
+        
+    staff_list = config[guild_id]['ticket_staff']
+    
+    if action.value == "add":
+        if role.id not in staff_list:
+            staff_list.append(role.id)
+            save_config(config)
+            await interaction.response.send_message(f"Role {role.mention} added to Ticket Staff.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Role {role.mention} is already Ticket Staff.", ephemeral=True)
+            
+    elif action.value == "remove":
+        if role.id in staff_list:
+            staff_list.remove(role.id)
+            save_config(config)
+            await interaction.response.send_message(f"Role {role.mention} removed from Ticket Staff.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Role {role.mention} is not in Ticket Staff list.", ephemeral=True)
 
 if __name__ == '__main__':
     if not TOKEN:
