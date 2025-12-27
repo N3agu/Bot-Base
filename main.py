@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import discord
+import datetime
 from discord import app_commands
 from discord.ext import commands
 from discord import ui
@@ -15,20 +16,22 @@ logging.basicConfig(
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 CONFIG_FILE = 'config.json'
+INVITES_FILE = 'invites_data.json'
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.reactions = True
+intents.invites = True
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
+def load_json(filename):
+    if not os.path.exists(filename):
         return {}
-    with open(CONFIG_FILE, 'r') as f:
+    with open(filename, 'r') as f:
         return json.load(f)
 
-def save_config(data):
-    with open(CONFIG_FILE, 'w') as f:
+def save_json(filename, data):
+    with open(filename, 'w') as f:
         json.dump(data, f, indent=4)
 
 def replace_placeholders(obj, member):
@@ -41,7 +44,7 @@ def replace_placeholders(obj, member):
     return obj
 
 def apply_theme(data, guild_id):
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     if guild_id not in config or 'theme' not in config[guild_id]:
         return data
 
@@ -65,14 +68,13 @@ def is_staff(interaction: discord.Interaction):
     if interaction.user.guild_permissions.administrator:
         return True
     
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     guild_id = str(interaction.guild_id)
     if guild_id in config and 'ticket_staff' in config[guild_id]:
         staff_roles = config[guild_id]['ticket_staff']
         user_role_ids = [r.id for r in interaction.user.roles]
         if any(sid in user_role_ids for sid in staff_roles):
             return True
-            
     return False
 
 def get_owner_id(channel):
@@ -151,7 +153,7 @@ class TicketView(ui.View):
     async def create_ticket(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer(ephemeral=True)
         
-        config = load_config()
+        config = load_json(CONFIG_FILE)
         message_id = str(interaction.message.id)
         guild_id = str(interaction.guild_id)
         
@@ -200,6 +202,10 @@ class TicketView(ui.View):
             await interaction.followup.send("Failed to create ticket channel. Check bot permissions.", ephemeral=True)
 
 class MyBot(commands.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.invite_cache = {} # {guild_id: {code: uses}}
+
     async def setup_hook(self):
         self.tree.on_error = self.on_tree_error
         self.add_view(TicketView())
@@ -214,6 +220,15 @@ class MyBot(commands.Bot):
             logging.error(f"Interaction error: {error}")
             if not interaction.response.is_done():
                 await interaction.response.send_message("An internal error occurred.", ephemeral=True)
+    
+    async def cache_invites(self):
+        for guild in self.guilds:
+            try:
+                invites = await guild.invites()
+                self.invite_cache[guild.id] = {invite.code: invite.uses for invite in invites}
+            except discord.Forbidden:
+                logging.warning(f"Missing permissions to fetch invites for {guild.name}")
+                self.invite_cache[guild.id] = {}
 
 bot = MyBot(command_prefix='!', intents=intents)
 
@@ -221,13 +236,16 @@ bot = MyBot(command_prefix='!', intents=intents)
 async def on_ready():
     logging.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
     
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     
     if 'bot_status' in config:
         status_data = config['bot_status']
         activity_type = getattr(discord.ActivityType, status_data['type'], discord.ActivityType.playing)
         await bot.change_presence(activity=discord.Activity(type=activity_type, name=status_data['text']))
         logging.info("Restored bot status.")
+    
+    await bot.cache_invites()
+    logging.info("Invites cached.")
 
     for guild in bot.guilds:
         guild_id = str(guild.id)
@@ -236,64 +254,137 @@ async def on_ready():
             role = guild.get_role(role_id)
             
             if role:
-                logging.info(f"Checking roles for {guild.name}...")
-                count = 0
                 for member in guild.members:
                     if not member.bot and role not in member.roles:
                         try:
                             await member.add_roles(role)
-                            count += 1
-                        except discord.Forbidden:
-                            logging.error(f"Missing permissions to assign role in {guild.name}")
-                            break
-                        except Exception as e:
-                            logging.error(f"Failed to assign role: {e}")
-                if count > 0:
-                    logging.info(f"Backfilled role to {count} members in {guild.name}")
+                        except:
+                            continue
+
+@bot.event
+async def on_invite_create(invite):
+    if invite.guild.id not in bot.invite_cache:
+        bot.invite_cache[invite.guild.id] = {}
+    bot.invite_cache[invite.guild.id][invite.code] = invite.uses
+
+@bot.event
+async def on_invite_delete(invite):
+    if invite.guild.id in bot.invite_cache:
+        bot.invite_cache[invite.guild.id].pop(invite.code, None)
 
 @bot.event
 async def on_member_join(member):
-    config = load_config()
+    config = load_json(CONFIG_FILE)
+    invites_data = load_json(INVITES_FILE)
     guild_id = str(member.guild.id)
     
-    if guild_id not in config:
-        return
+    if guild_id in config:
+        settings = config[guild_id]
+        if settings.get('role_id'):
+            role = member.guild.get_role(settings['role_id'])
+            if role:
+                try:
+                    await member.add_roles(role)
+                except discord.Forbidden:
+                    logging.error(f"Cannot assign welcome role in {member.guild.id}")
 
-    settings = config[guild_id]
+        if settings.get('channel_id') and settings.get('embed_data'):
+            channel = member.guild.get_channel(settings['channel_id'])
+            if channel:
+                try:
+                    raw_data = settings['embed_data']
+                    data = apply_theme(raw_data, guild_id)
+                    data = replace_placeholders(data, member)
+                    content = data.get('content')
+                    embeds = []
+                    if 'embeds' in data:
+                        embeds = [discord.Embed.from_dict(e) for e in data['embeds']]
+                    elif any(k in data for k in ('title', 'description', 'fields', 'color')):
+                        embeds = [discord.Embed.from_dict(data)]
+                    await channel.send(content=content, embeds=embeds[:10])
+                except Exception as e:
+                    logging.error(f"Failed to send welcome message: {e}")
+
+    track_channel_id = config.get(guild_id, {}).get('invite_log_channel')
+    inviter = None
     
-    if settings.get('role_id'):
-        role = member.guild.get_role(settings['role_id'])
-        if role:
-            try:
-                await member.add_roles(role)
-            except discord.Forbidden:
-                logging.error(f"Cannot assign welcome role in {member.guild.id}")
+    if track_channel_id:
+        try:
+            current_invites = await member.guild.invites()
+            cached_invites = bot.invite_cache.get(member.guild.id, {})
+            
+            used_invite = None
+            for invite in current_invites:
+                old_uses = cached_invites.get(invite.code, 0)
+                if invite.uses > old_uses:
+                    used_invite = invite
+                    break
+            
+            bot.invite_cache[member.guild.id] = {inv.code: inv.uses for inv in current_invites}
+            
+            if used_invite:
+                inviter = used_invite.inviter
+                
+                now = datetime.datetime.now(datetime.timezone.utc)
+                account_age = now - member.created_at
+                is_fake = account_age.total_seconds() < 86400 # 24 hours
+                
+                if guild_id not in invites_data:
+                    invites_data[guild_id] = {}
+                
+                invites_data[guild_id][str(member.id)] = {
+                    "inviter_id": inviter.id,
+                    "is_fake": is_fake
+                }
+                save_json(INVITES_FILE, invites_data)
+                
+                inviter_records = [
+                    (uid, data) for uid, data in invites_data[guild_id].items()
+                    if data.get('inviter_id') == inviter.id
+                ]
+                
+                real_count = 0
+                fake_count = 0
+                left_count = 0
+                
+                for uid_str, data in inviter_records:
+                    if data.get('is_fake'):
+                        fake_count += 1
+                        continue
+                        
+                    mem = member.guild.get_member(int(uid_str))
+                    if mem:
+                        real_count += 1
+                    else:
+                        left_count += 1
 
-    if settings.get('channel_id') and settings.get('embed_data'):
-        channel = member.guild.get_channel(settings['channel_id'])
-        if channel:
-            try:
-                raw_data = settings['embed_data']
-                data = apply_theme(raw_data, guild_id)
-                data = replace_placeholders(data, member)
-                
-                content = data.get('content')
-                embeds = []
-                if 'embeds' in data:
-                    embeds = [discord.Embed.from_dict(e) for e in data['embeds']]
-                elif any(k in data for k in ('title', 'description', 'fields', 'color')):
-                    embeds = [discord.Embed.from_dict(data)]
-                
-                await channel.send(content=content, embeds=embeds[:10])
-            except Exception as e:
-                logging.error(f"Failed to send welcome message: {e}")
+                channel = member.guild.get_channel(track_channel_id)
+                if channel:
+                    embed_data = {
+                        "title": f"Welcome {member.name}",
+                        "description": f"Invited by {inviter.mention}",
+                        "thumbnail": {"url": member.avatar.url if member.avatar else member.default_avatar.url},
+                        "fields": [
+                            {"name": "Real", "value": str(real_count), "inline": True},
+                            {"name": "Fake", "value": str(fake_count), "inline": True},
+                            {"name": "Left", "value": str(left_count), "inline": True}
+                        ],
+                        "footer": {"text": f"Account Created: {member.created_at.strftime('%Y-%m-%d %H:%M:%S')}"}
+                    }
+                    embed_data = apply_theme(embed_data, guild_id)
+                    await channel.send(embed=discord.Embed.from_dict(embed_data))
+                    
+        except discord.Forbidden:
+            logging.error("Permission denied for invite tracking.")
+        except Exception as e:
+            logging.error(f"Invite tracking error: {e}")
 
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.member.bot:
         return
 
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     message_id = str(payload.message_id)
     
     if 'reaction_roles' in config and message_id in config['reaction_roles']:
@@ -309,11 +400,11 @@ async def on_raw_reaction_add(payload):
                     try:
                         await payload.member.add_roles(role)
                     except discord.Forbidden:
-                        logging.error(f"Missing permissions to add role {role.name} in {guild.name}")
+                        logging.error(f"Missing permissions to add role {role.name}")
 
 @bot.event
 async def on_raw_reaction_remove(payload):
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     message_id = str(payload.message_id)
     
     if 'reaction_roles' in config and message_id in config['reaction_roles']:
@@ -331,7 +422,7 @@ async def on_raw_reaction_remove(payload):
                         try:
                             await member.remove_roles(role)
                         except discord.Forbidden:
-                            logging.error(f"Missing permissions to remove role {role.name} in {guild.name}")
+                            logging.error(f"Missing permissions to remove role {role.name}")
 
 @bot.tree.command(name="theme", description="Set default colors for server embeds")
 @app_commands.describe(primary="Hex code for primary color", secondary="Hex code for secondary color")
@@ -341,7 +432,7 @@ async def theme_command(interaction: discord.Interaction, primary: str, secondar
         p_int = int(primary.strip('#'), 16)
         s_int = int(secondary.strip('#'), 16) if secondary else None
         
-        config = load_config()
+        config = load_json(CONFIG_FILE)
         guild_id = str(interaction.guild_id)
         
         if guild_id not in config:
@@ -351,7 +442,7 @@ async def theme_command(interaction: discord.Interaction, primary: str, secondar
              config[guild_id]['theme'] = {}
 
         config[guild_id]['theme'] = {'primary': p_int, 'secondary': s_int}
-        save_config(config)
+        save_json(CONFIG_FILE, config)
         
         embed = discord.Embed(title="Theme Updated", description=f"Primary set to {primary}", color=p_int)
         if s_int: embed.add_field(name="Secondary", value=secondary)
@@ -399,7 +490,7 @@ async def welcome_command(interaction: discord.Interaction, channel: discord.Tex
              await interaction.response.send_message("Invalid JSON.", ephemeral=True)
              return
 
-        config = load_config()
+        config = load_json(CONFIG_FILE)
         guild_id = str(interaction.guild_id)
         
         if guild_id not in config:
@@ -411,7 +502,7 @@ async def welcome_command(interaction: discord.Interaction, channel: discord.Tex
             "role_id": role.id if role else None
         })
         
-        save_config(config)
+        save_json(CONFIG_FILE, config)
         await interaction.response.send_message(f"Welcome message set to {channel.mention}.")
     except json.JSONDecodeError:
         await interaction.response.send_message("Error: Invalid JSON format.", ephemeral=True)
@@ -511,9 +602,9 @@ async def status_command(interaction: discord.Interaction, activity: app_command
         act_type = type_map.get(activity.value, discord.ActivityType.playing)
         await bot.change_presence(activity=discord.Activity(type=act_type, name=text))
         
-        config = load_config()
+        config = load_json(CONFIG_FILE)
         config['bot_status'] = {'type': activity.value, 'text': text}
-        save_config(config)
+        save_json(CONFIG_FILE, config)
         
         await interaction.response.send_message(f"Status updated to: {activity.name} {text}", ephemeral=True)
     except Exception as e:
@@ -572,12 +663,12 @@ async def ticketpanel_command(interaction: discord.Interaction, channel: discord
 
         message = await channel.send(content=content, embeds=embeds[:10], view=view)
         
-        config = load_config()
+        config = load_json(CONFIG_FILE)
         if 'tickets' not in config:
             config['tickets'] = {}
         
         config['tickets'][str(message.id)] = cat_id_int
-        save_config(config)
+        save_json(CONFIG_FILE, config)
 
         await interaction.response.send_message(f"Ticket panel created in {channel.mention}", ephemeral=True)
 
@@ -595,7 +686,7 @@ async def ticketpanel_command(interaction: discord.Interaction, channel: discord
 ])
 @app_commands.checks.has_permissions(administrator=True)
 async def ticketstaff_command(interaction: discord.Interaction, action: app_commands.Choice[str], role: discord.Role):
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     guild_id = str(interaction.guild_id)
     
     if guild_id not in config:
@@ -609,7 +700,7 @@ async def ticketstaff_command(interaction: discord.Interaction, action: app_comm
     if action.value == "add":
         if role.id not in staff_list:
             staff_list.append(role.id)
-            save_config(config)
+            save_json(CONFIG_FILE, config)
             await interaction.response.send_message(f"Role {role.mention} added to Ticket Staff.", ephemeral=True)
         else:
             await interaction.response.send_message(f"Role {role.mention} is already Ticket Staff.", ephemeral=True)
@@ -617,7 +708,7 @@ async def ticketstaff_command(interaction: discord.Interaction, action: app_comm
     elif action.value == "remove":
         if role.id in staff_list:
             staff_list.remove(role.id)
-            save_config(config)
+            save_json(CONFIG_FILE, config)
             await interaction.response.send_message(f"Role {role.mention} removed from Ticket Staff.", ephemeral=True)
         else:
             await interaction.response.send_message(f"Role {role.mention} is not in Ticket Staff list.", ephemeral=True)
@@ -640,7 +731,6 @@ async def reactionrole_command(interaction: discord.Interaction, question: str, 
     
     for i, option_name in enumerate(option_list):
         emoji = emojis[i]
-        
         role = discord.utils.get(interaction.guild.roles, name=option_name)
         if not role:
             try:
@@ -664,14 +754,29 @@ async def reactionrole_command(interaction: discord.Interaction, question: str, 
     for emoji in emojis:
         await message.add_reaction(emoji)
         
-    config = load_config()
+    config = load_json(CONFIG_FILE)
     if 'reaction_roles' not in config:
         config['reaction_roles'] = {}
         
     config['reaction_roles'][str(message.id)] = role_map
-    save_config(config)
+    save_json(CONFIG_FILE, config)
     
     await interaction.followup.send("Reaction role created!", ephemeral=True)
+
+@bot.tree.command(name="trackinvites", description="Set channel for invite tracking logs")
+@app_commands.describe(channel="Channel to post invite logs")
+@app_commands.checks.has_permissions(administrator=True)
+async def trackinvites_command(interaction: discord.Interaction, channel: discord.TextChannel):
+    config = load_json(CONFIG_FILE)
+    guild_id = str(interaction.guild_id)
+    
+    if guild_id not in config:
+        config[guild_id] = {}
+        
+    config[guild_id]['invite_log_channel'] = channel.id
+    save_json(CONFIG_FILE, config)
+    
+    await interaction.response.send_message(f"Invite tracking logs will be posted in {channel.mention}.")
 
 if __name__ == '__main__':
     if not TOKEN:
