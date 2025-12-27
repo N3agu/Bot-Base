@@ -19,6 +19,7 @@ CONFIG_FILE = 'config.json'
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.reactions = True
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -61,7 +62,6 @@ def apply_theme(data, guild_id):
     return data
 
 def is_staff(interaction: discord.Interaction):
-    """Checks if the user is Admin or has a Ticket Staff role."""
     if interaction.user.guild_permissions.administrator:
         return True
     
@@ -70,14 +70,12 @@ def is_staff(interaction: discord.Interaction):
     if guild_id in config and 'ticket_staff' in config[guild_id]:
         staff_roles = config[guild_id]['ticket_staff']
         user_role_ids = [r.id for r in interaction.user.roles]
-
         if any(sid in user_role_ids for sid in staff_roles):
             return True
             
     return False
 
 def get_owner_id(channel):
-    """Extracts owner ID from channel topic."""
     if channel.topic and channel.topic.startswith("Ticket Owner:"):
         try:
             return int(channel.topic.split(":")[1].strip())
@@ -149,7 +147,7 @@ class TicketView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @ui.button(label="Open Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket", emoji="📩")
+    @ui.button(label="Open Ticket", style=discord.ButtonStyle.secondary, custom_id="create_ticket", emoji="📩")
     async def create_ticket(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer(ephemeral=True)
         
@@ -289,6 +287,51 @@ async def on_member_join(member):
                 await channel.send(content=content, embeds=embeds[:10])
             except Exception as e:
                 logging.error(f"Failed to send welcome message: {e}")
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.member.bot:
+        return
+
+    config = load_config()
+    message_id = str(payload.message_id)
+    
+    if 'reaction_roles' in config and message_id in config['reaction_roles']:
+        role_map = config['reaction_roles'][message_id]
+        emoji_key = str(payload.emoji)
+        
+        if emoji_key in role_map:
+            role_id = role_map[emoji_key]
+            guild = bot.get_guild(payload.guild_id)
+            if guild:
+                role = guild.get_role(role_id)
+                if role:
+                    try:
+                        await payload.member.add_roles(role)
+                    except discord.Forbidden:
+                        logging.error(f"Missing permissions to add role {role.name} in {guild.name}")
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    config = load_config()
+    message_id = str(payload.message_id)
+    
+    if 'reaction_roles' in config and message_id in config['reaction_roles']:
+        role_map = config['reaction_roles'][message_id]
+        emoji_key = str(payload.emoji)
+        
+        if emoji_key in role_map:
+            role_id = role_map[emoji_key]
+            guild = bot.get_guild(payload.guild_id)
+            if guild:
+                member = guild.get_member(payload.user_id)
+                if member and not member.bot:
+                    role = guild.get_role(role_id)
+                    if role:
+                        try:
+                            await member.remove_roles(role)
+                        except discord.Forbidden:
+                            logging.error(f"Missing permissions to remove role {role.name} in {guild.name}")
 
 @bot.tree.command(name="theme", description="Set default colors for server embeds")
 @app_commands.describe(primary="Hex code for primary color", secondary="Hex code for secondary color")
@@ -514,7 +557,6 @@ async def ticketpanel_command(interaction: discord.Interaction, channel: discord
             return
 
         view = TicketView()
-        
         color_map = {
             "gray": discord.ButtonStyle.secondary,
             "blue": discord.ButtonStyle.primary,
@@ -579,6 +621,57 @@ async def ticketstaff_command(interaction: discord.Interaction, action: app_comm
             await interaction.response.send_message(f"Role {role.mention} removed from Ticket Staff.", ephemeral=True)
         else:
             await interaction.response.send_message(f"Role {role.mention} is not in Ticket Staff list.", ephemeral=True)
+
+@bot.tree.command(name="reactionrole", description="Create a reaction role message")
+@app_commands.describe(question="The question/title for the reaction role", options="Options separated by |")
+@app_commands.checks.has_permissions(administrator=True)
+async def reactionrole_command(interaction: discord.Interaction, question: str, options: str):
+    await interaction.response.defer()
+    
+    option_list = [opt.strip() for opt in options.split('|') if opt.strip()]
+    if len(option_list) > 20:
+        await interaction.followup.send("Too many options (max 20).", ephemeral=True)
+        return
+        
+    emojis = [chr(0x1f1e6 + i) for i in range(len(option_list))]
+    
+    description_lines = []
+    role_map = {}
+    
+    for i, option_name in enumerate(option_list):
+        emoji = emojis[i]
+        
+        role = discord.utils.get(interaction.guild.roles, name=option_name)
+        if not role:
+            try:
+                role = await interaction.guild.create_role(name=option_name, reason="Reaction Role Creation")
+            except discord.Forbidden:
+                await interaction.followup.send("Error: Bot missing permissions to create roles.", ephemeral=True)
+                return
+        
+        role_map[emoji] = role.id
+        description_lines.append(f"{emoji} : {role.mention}")
+        
+    embed_data = {
+        "title": question,
+        "description": "\n\n".join(description_lines)
+    }
+    embed_data = apply_theme(embed_data, str(interaction.guild_id))
+    embed = discord.Embed.from_dict(embed_data)
+    
+    message = await interaction.channel.send(embed=embed)
+    
+    for emoji in emojis:
+        await message.add_reaction(emoji)
+        
+    config = load_config()
+    if 'reaction_roles' not in config:
+        config['reaction_roles'] = {}
+        
+    config['reaction_roles'][str(message.id)] = role_map
+    save_config(config)
+    
+    await interaction.followup.send("Reaction role created!", ephemeral=True)
 
 if __name__ == '__main__':
     if not TOKEN:
