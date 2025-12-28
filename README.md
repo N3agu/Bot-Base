@@ -1,6 +1,6 @@
 <div align=center>
   <h1>Bot Base</h1>
-<br/><img src="https://raw.githubusercontent.com/N3agu/Bot-Base/refs/heads/main/Images/logo.png" width="256">
+<img src="https://raw.githubusercontent.com/N3agu/Bot-Base/refs/heads/main/Images/logo.png" width="220">
 </div>
 
 ## Summary
